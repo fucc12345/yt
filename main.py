@@ -1,49 +1,62 @@
-from fastapi import FastAPI, Request
-from pydantic import BaseModel
-import subprocess
-import uuid
-import os
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
+import yt_dlp
+import os
+import uuid
 
 app = FastAPI()
 
-# Serve frontend files from /static
+# Mount static folder to serve frontend files like index.html
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
-class VideoRequest(BaseModel):
-    url: str
+# Serve index.html at root "/"
+@app.get("/")
+async def root():
+    return FileResponse("static/index.html")
 
+# POST endpoint to download video from YouTube URL
 @app.post("/download")
-async def download_video(data: VideoRequest):
-    url = data.url
-    video_id = str(uuid.uuid4())
-    output_template = f"downloads/{video_id}.%(ext)s"
+async def download_video(request: Request):
+    data = await request.json()
+    url = data.get("url")
+    if not url:
+        raise HTTPException(status_code=400, detail="Missing url parameter")
 
-    os.makedirs("downloads", exist_ok=True)
+    # Generate unique filename for download folder
+    download_id = str(uuid.uuid4())
+    output_dir = "downloads"
+    os.makedirs(output_dir, exist_ok=True)
+    output_template = os.path.join(output_dir, f"{download_id}.%(ext)s")
 
-    command = [
-        "yt-dlp",
-        "-f", "bestvideo+bestaudio/best",
-        "--merge-output-format", "mp4",
-        "-o", output_template,
-        url
-    ]
+    ydl_opts = {
+        "outtmpl": output_template,
+        "format": "bestvideo+bestaudio/best",
+        "merge_output_format": "mp4",
+        "quiet": True,
+    }
 
     try:
-        subprocess.run(command, check=True)
-        file_path = f"downloads/{video_id}.mp4"
-        if os.path.exists(file_path):
-            return {"status": "success", "file": f"/download/{video_id}"}
-        else:
-            return {"status": "error", "message": "File not found after download."}
-    except subprocess.CalledProcessError as e:
-        return {"status": "error", "message": str(e)}
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info_dict = ydl.extract_info(url, download=True)
+            filename = ydl.prepare_filename(info_dict)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Download failed: {e}")
 
-@app.get("/download/{video_id}")
-async def serve_video(video_id: str):
-    file_path = f"downloads/{video_id}.mp4"
-    if os.path.exists(file_path):
-        return FileResponse(file_path, media_type="video/mp4", filename=f"{video_id}.mp4")
-    else:
-        return {"status": "error", "message": "Video not found."}
+    # Return info to client with file id and extension
+    return JSONResponse({
+        "download_id": download_id,
+        "filename": os.path.basename(filename),
+    })
+
+# GET endpoint to serve the downloaded file by download_id
+@app.get("/download/{download_id}")
+async def serve_video(download_id: str):
+    download_dir = "downloads"
+    # Find the file starting with download_id
+    for fname in os.listdir(download_dir):
+        if fname.startswith(download_id):
+            file_path = os.path.join(download_dir, fname)
+            if os.path.exists(file_path):
+                return FileResponse(file_path, media_type="video/mp4", filename=fname)
+    raise HTTPException(status_code=404, detail="File not found")
